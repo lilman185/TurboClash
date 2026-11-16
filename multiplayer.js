@@ -1,11 +1,11 @@
 (() => {
-  const DEFAULT_LOST = 'Player disconnected. Match ended.';
+  const DEFAULT_LOST = 'Match ended.';
   const NO_PLAYERS = 'No other players joined this match. Try again.';
   const RTC_CONFIG = { iceServers: [
     { urls: ['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302'] }
   ], ...(window.PLAYVORA_GAMES?.rtcConfig || {}) };
-  const STATE_QUEUE_LIMIT = 16384, INPUT_QUEUE_LIMIT = 2048;
-  const RECOVERY_MS = 18000;
+  const STATE_QUEUE_LIMIT = 256, INPUT_QUEUE_LIMIT = 256;
+  const RECOVERY_MS = 12000;
   class SnapshotBuffer {
     constructor() { this.clear(); }
     clear() {
@@ -57,7 +57,7 @@
     username: 'You', names: new Map(), skin: 'stock', skins: new Map(), onSkin: null,
     peers: new Map(), pendingCandidates: new Map(),
     polling: null, heartbeat: null, signalPolling: null, p2pHeartbeat: null, connectTimer: null,
-    searchTimeout: null, startupWatch: null,
+    searchTimeout: null, startupWatch: null, finalDelivery: null,
     finding: false, starting: false, active: false, ending: false, finished: false,
     lastPacket: 0, readyAt: 0, signalCursor: 0, signalBusy: false,
     snapshotSeq: 0, receivedSnapshotSeq: 0, rtt: .12, lastInput: null, jumpId: 0, signalFailures: 0,
@@ -77,7 +77,7 @@
   }
   function validRoom() { return !!API.room && (API.starting || API.active); }
   function cleanTimers() {
-    for (const x of ['polling','heartbeat','signalPolling','startupWatch','p2pHeartbeat']) {
+    for (const x of ['polling','heartbeat','signalPolling','startupWatch','p2pHeartbeat','finalDelivery']) {
       if (API[x]) clearInterval(API[x]); API[x] = null;
     }
     for (const x of ['searchTimeout','connectTimer']) {
@@ -138,7 +138,7 @@
   }
   function keepSignalingForRecovery() {
     if (API.signalPolling) clearInterval(API.signalPolling);
-    // Keep signaling available for ICE recovery throughout the match.
+
     API.signalPolling = validRoom() && !API.finished ? setInterval(pollSignals, 2000) : null;
   }
   function peerConnected(peer) {
@@ -187,8 +187,8 @@
         if (!validRoom() || API.finished || API.peers.get(peer.seat) !== peer) return;
         await peer.pc.setLocalDescription(offer);
       }
-      // If an answer or signaling request was lost, resend the pending offer
-      // instead of getting permanently stuck in have-local-offer.
+
+
       await signal(peer.userId,{kind:'offer',sdp:peer.pc.localDescription.sdp,username:API.username});
     } catch (err) {
       console.warn('Peer recovery will retry:', errorText(err));
@@ -202,7 +202,7 @@
     },1000);
     peer.disconnectTimer = setTimeout(()=>{
       peer.disconnectTimer=null;
-      if (validRoom() && !API.finished && !peerConnected(peer)) lost(DEFAULT_LOST,'disconnect');
+      if (validRoom() && !API.finished && !peerConnected(peer)) lost(DEFAULT_LOST,'disconnect',peer.seat);
     },RECOVERY_MS);
   }
   function applySnapshot(packet) {
@@ -212,8 +212,8 @@
     API.lastPacket=Date.now();
     if (API.onSnapshot) API.onSnapshot(packet.data);
   }
-  // A replay uses the reliable ordered control channel. Chunk size stays below
-  // the WebRTC per-message limit even in six-player matches.
+
+
   function sendReplay(id, source, team, scorerSeat) {
     if (!API.active || !API.isHost || !source || !Number.isInteger(id)) return;
     const bytes=new Uint8Array(source.buf.buffer,source.buf.byteOffset,source.buf.byteLength);
@@ -223,7 +223,7 @@
     const base64=btoa(binary), chunks=[];
     for (let at=0;at<base64.length;at+=4000) chunks.push(base64.slice(at,at+4000));
     for (const peer of API.peers.values()) {
-      // Cancel only an older replay's unsent chunks when a new goal occurs.
+
       const job={id,index:0,chunks,meta:{type:'replay-meta',id,stride:source.stride,
         count:source.count,team,scorerSeat,parts:chunks.length},metaSent:false,started:Date.now()};
       peer.replayJob=job;
@@ -234,12 +234,13 @@
           if (!sendControl(peer,job.meta)) { setTimeout(pump,50); return; }
           job.metaSent=true;
         }
-        while (job.index<chunks.length && peer.control.bufferedAmount<16000) {
+        // Bound replay upload pressure so pings, goals and results keep moving.
+        while (job.index<chunks.length && peer.control.bufferedAmount<6000) {
           if (!sendControl(peer,{type:'replay-chunk',id,index:job.index,
               value:chunks[job.index]})) { setTimeout(pump,50); return; }
           job.index++;
         }
-        if (job.index<chunks.length) setTimeout(pump,30);
+        if (job.index<chunks.length) setTimeout(pump,20);
       };
       pump();
     }
@@ -277,11 +278,21 @@
     let packet;
     try { packet=JSON.parse(data); } catch (_) { return; }
     if (!packet || typeof packet !== 'object') return;
-    // The host sends the authoritative final score over the reliable channel.
-    // A normal peer departure AFTER this point is not a match disconnect.
+
+
+    if (packet.type==='match-finished-ack') {
+      if (API.isHost && API.finished) {
+        peer.ackedFinal=true;
+        if ([...API.peers.values()].every(p=>p.ackedFinal) && API.finalDelivery) {
+          clearInterval(API.finalDelivery); API.finalDelivery=null;
+        }
+      }
+      return;
+    }
     if (packet.type==='match-finished') {
-      if (API.finished || API.isHost || !API.active || peer.seat!==0 ||
-          !packet.data || packet.data.state!=='ended' ||
+      if (API.isHost || !API.active || peer.seat!==0) return;
+      if (API.finished) { sendControl(peer,{type:'match-finished-ack'}); return; }
+      if (!packet.data || packet.data.state!=='ended' ||
           !Array.isArray(packet.data.cars) || !Array.isArray(packet.data.scores)) return;
       finishMatch();
       if (API.onSnapshot) API.onSnapshot(packet.data);
@@ -289,7 +300,10 @@
       return;
     }
     if (API.finished) return;
-    if (packet.type==='leaving') { lost(DEFAULT_LOST,'disconnect'); return; }
+    if (packet.type==='leaving') { lost(DEFAULT_LOST,'disconnect',peer.seat); return; }
+    if (packet.type==='match-disconnected' && Number.isInteger(packet.seat) && packet.seat >= 0 && packet.seat < API.members.length) {
+      lost(DEFAULT_LOST,'disconnect',packet.seat); return;
+    }
     if (packet.type==='start' && !API.isHost) {
       if (packet.names && typeof packet.names==='object') {
         for (const [seat,name] of Object.entries(packet.names)) receivedName(name,Number(seat));
@@ -344,6 +358,9 @@
     channel.onerror=()=>detectDisconnect(peer);
     channel.onmessage=ev=>{
       peer.lastSeen=Date.now();
+      // Any host traffic, including reliable heartbeat/replay packets, proves
+      // the connection is alive even when live snapshots are backpressured.
+      if (!API.isHost && API.active && peer.seat===0) API.lastPacket=peer.lastSeen;
       handleData(peer,ev.data);
     };
   }
@@ -451,7 +468,7 @@
       if (!API.active || API.ending || API.finished) return;
       const now=Date.now();
       for (const peer of API.peers.values()) {
-        if (now-peer.lastSeen>RECOVERY_MS+2000) { lost(DEFAULT_LOST,'disconnect'); return; }
+        if (now-peer.lastSeen>RECOVERY_MS+2000) { lost(DEFAULT_LOST,'disconnect',peer.seat); return; }
         if (now-peer.lastSeen>4000 || !peerConnected(peer)) restartPeer(peer);
         sendControl(peer,{type:'ping',t:performance.now()});
       }
@@ -500,7 +517,7 @@
           if (!API.finding) return;
           if (!st || typeof st.status !== 'string') throw new Error('Invalid matchmaking response.');
           if (st.status==='none' || st.status==='cancelled') return lost(NO_PLAYERS,'error');
-          // A retry reveals the search screen only after the queue responds successfully.
+
           if (onSearching) { const ready=onSearching; onSearching=null; ready(); }
           if (st.status==='ready' && Array.isArray(st.players) && st.players.length===settings.mode*2) {
             API.members=st.players;
@@ -522,10 +539,22 @@
   }
   function finishMatch(snapshot=null) {
     if (!API.active || API.finished) return;
-    // The host announces completion before stopping the network monitors.
+
     if (API.isHost && snapshot && snapshot.state==='ended') {
-      for (const peer of API.peers.values())
-        sendControl(peer,{type:'match-finished',data:snapshot});
+      const room=API.room, start=Date.now();
+      for (const peer of API.peers.values()) peer.ackedFinal=false;
+      const deliver=()=>{
+        if (API.room!==room || Date.now()-start>10000 ||
+            [...API.peers.values()].every(peer=>peer.ackedFinal)) {
+          if (API.finalDelivery) clearInterval(API.finalDelivery);
+          API.finalDelivery=null;
+          return;
+        }
+        for (const peer of API.peers.values())
+          if (!peer.ackedFinal) sendControl(peer,{type:'match-finished',data:snapshot});
+      };
+      deliver();
+      API.finalDelivery=setInterval(deliver,400);
     }
     API.finished=true;
     for (const timer of ['p2pHeartbeat','heartbeat','signalPolling']) {
@@ -546,27 +575,31 @@
     if (host.state && host.state.readyState==='open' && host.state.bufferedAmount<INPUT_QUEUE_LIMIT) {
       try { host.state.send(packet); } catch (_) {}
     }
-    // Jump/release edges and neutral controls also travel reliably. Sequence
-    // checks make duplicates harmless, without queueing old movement frames.
+
+
     const edge=!API.lastInput || controls.slice(4).some((v,i)=>v!==API.lastInput[i+4]) ||
       (controls.every(v=>v===0) && API.lastInput.some(v=>v!==0));
-    if (edge && host.control?.bufferedAmount<4096) sendControl(host,message);
+    if (edge && host.control?.bufferedAmount<2048) sendControl(host,message);
     API.lastInput=controls.slice();
   }
   function sendSnapshot(snapshot) {
     if (!API.active || API.finished || !API.isHost) return;
     const message={type:'snapshot',seq:++API.snapshotSeq,data:snapshot};
-    // Millimetre-scale precision is ample for this arena and roughly halves
-    // bandwidth without altering the authoritative simulation.
+
+
     const packet=JSON.stringify(message,(key,v)=>typeof v==='number' && !Number.isInteger(v) ? Math.round(v*10000)/10000 : v);
     const phase=snapshot.state+':'+snapshot.goalId;
+    let phasePacket=null;
     for (const peer of API.peers.values()) {
       if (peer.state && peer.state.readyState==='open' && peer.state.bufferedAmount<STATE_QUEUE_LIMIT) {
         try { peer.state.send(packet); } catch (_) { detectDisconnect(peer); }
       }
-      // Only phase changes need reliable delivery. Old per-frame snapshots
-      // must never build a second queue behind goal replay chunks.
-      if (peer.lastPhase!==phase && sendControl(peer,JSON.parse(packet))) peer.lastPhase=phase;
+
+
+      if (peer.lastPhase!==phase) {
+        if (!phasePacket) phasePacket=JSON.parse(packet);
+        if (sendControl(peer,phasePacket)) peer.lastPhase=phase;
+      }
     }
   }
   async function cancel() {
@@ -586,12 +619,16 @@
     API.room=null; API.seat=-1; API.members=[]; API.isHost=false;
     if (room && API.client) await rpc('tc_leave').catch(()=>{});
   }
-  async function lost(message,reason='error') {
+  async function lost(message,reason='error',disconnectedSeat=null) {
     if (API.finished || API.ending || (!API.room && !API.finding && !API.starting && !API.active)) return;
     API.ending=true;
+    if (API.active && reason==='disconnect' && Number.isInteger(disconnectedSeat)) {
+      for (const peer of API.peers.values())
+        if (peer.seat!==disconnectedSeat) sendControl(peer,{type:'match-disconnected',seat:disconnectedSeat});
+    }
     const cb=API.onLost;
-    await cancel();
-    if (cb) cb(message,reason);
+    try { if (cb) cb(message,reason,disconnectedSeat); }
+    finally { await cancel(); }
   }
   API.setUsername=name=>{
     if (!validUsername(name)) throw new Error('Invalid username');
