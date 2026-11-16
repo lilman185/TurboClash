@@ -7,6 +7,7 @@
       THREE = await import('https://unpkg.com/three@0.160.0/build/three.module.js');
     }
 await new Promise(r => requestAnimationFrame(() => setTimeout(r, 30)));
+const LOW_LAG_MODE = false;
 const V3 = THREE.Vector3, Q4 = THREE.Quaternion;
 const $ = id => document.getElementById(id);
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
@@ -138,8 +139,10 @@ const HDR_OK = (() => {
 })();
 const renderer = new THREE.WebGLRenderer({ canvas: $('gl'), antialias: true, powerPreference: 'high-performance' });
 function renderPixelRatio() {
-    return Math.max(1, Math.min(2, Math.max(1.25, devicePixelRatio || 1),
-        Math.sqrt(3600000 / Math.max(1, innerWidth * innerHeight))));
+    // Full scene quality is kept. Adaptive internal resolution limits GPU
+    // overload on high-DPI displays without hiding sky, crowds or shadows.
+    return Math.max(.9, Math.min(1.6, devicePixelRatio || 1,
+        Math.sqrt(2500000 / Math.max(1, innerWidth * innerHeight))));
 }
 let PR_MAX = renderPixelRatio();
 let prCur = PR_MAX;
@@ -165,7 +168,7 @@ addEventListener('resize', () => {
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
     PR_MAX = renderPixelRatio();
-    prCur = Math.min(PR_MAX, Math.max(1, prCur));
+    prCur = Math.min(PR_MAX, Math.max(.9, prCur));
     prNext = 0;
     renderer.setPixelRatio(prCur);
     renderer.setSize(innerWidth, innerHeight);
@@ -273,7 +276,7 @@ function buildEnv() {
     scene.add(sky);
 }
 function probeEnv() {
-    if (probeAt < 0)
+    if (probeAt < 0 || (online.active && state !== 'ended'))
         return;
     if (!probeRT) {
         probeRT = new THREE.WebGLCubeRenderTarget(256, { type: THREE.HalfFloatType });
@@ -1180,6 +1183,8 @@ function buildStadium() {
             scene.add(c);
         }
     }
+    // The crowd cards remain visible. Thousands of expensive, animated
+    // 3D spectator instances are unnecessary for the low-lag profile.
     buildCrowd3D();
     buildCrowdCards();
 }
@@ -1356,9 +1361,19 @@ function buildCrowdCards() {
 }
 const jumboC = mkCanvas(1024, 430);
 let jumboKey = '', lastGoalTeam = -1, lastOwnGoalBy = null;
+function goalAnnouncement(team = lastGoalTeam, scorerIndex = replayScorer, ownGoalName = lastOwnGoalBy) {
+    if (ownGoalName) return `SELF GOAL BY ${ownGoalName}!`;
+    const scorer = scorerIndex >= 0 ? cars[scorerIndex] : null;
+    return `${scorer ? scorer.name : TEAM_NAME[team]} SCORED!`;
+}
+// Use the same clock text on the HUD and every in-stadium screen.
+// The final whistle always freezes the match clock at 0:00, even in overtime.
+function scoreboardClockText() {
+    return state === 'ended' ? '0:00' : overtime ? '+' + fmt(otTime) : fmt(timeLeft);
+}
 function drawJumbo() {
-    const clock = overtime ? '+' + fmt(otTime) : fmt(timeLeft), flash = state === 'goal' || state === 'replay' ? lastGoalTeam : -1, rp = state === 'replay', fin = rp && !!(replay && replay.final);
-    const key = `${scoreArr[0]}|${scoreArr[1]}|${attract ? 'A' : clock}|${flash}|${rp}|${fin}|${replayScorer}|${lastOwnGoalBy}`;
+    const clock = scoreboardClockText(), flash = state === 'goal' || state === 'replay' ? lastGoalTeam : -1, rp = state === 'replay', fin = rp && !!(replay && replay.final);
+    const key = `${state}|${scoreArr[0]}|${scoreArr[1]}|${attract ? 'A' : clock}|${flash}|${rp}|${fin}|${replayScorer}|${lastOwnGoalBy}`;
     if (key === jumboKey)
         return;
     jumboKey = key;
@@ -1367,10 +1382,10 @@ function drawJumbo() {
     g.fillRect(0, 0, W, H);
     g.textAlign = 'center';
     g.textBaseline = 'middle';
-    if (flash >= 0) {
+    if (flash >= 0 || fin) {
         const gr = g.createLinearGradient(0, 0, W, H);
-        gr.addColorStop(0, flash ? '#ff3b3b' : '#3d86ff');
-        gr.addColorStop(1, flash ? '#6e0a10' : '#0b2a6e');
+        gr.addColorStop(0, flash === 1 ? '#ff3b3b' : flash === 0 ? '#3d86ff' : '#34425b');
+        gr.addColorStop(1, flash === 1 ? '#6e0a10' : flash === 0 ? '#0b2a6e' : '#141c30');
         g.fillStyle = gr;
         g.fillRect(0, 0, W, H);
         g.fillStyle = '#fff';
@@ -1383,10 +1398,7 @@ function drawJumbo() {
         }
         g.fillText(word, W / 2, H / 2 - 20);
         g.font = '800 46px Segoe UI, Arial';
-        const goalScorer = replayScorer >= 0 ? cars[replayScorer] : null;
-        const goalCaption = lastOwnGoalBy ? `OWN GOAL BY ${lastOwnGoalBy}` :
-            `${goalScorer ? goalScorer.name : TEAM_NAME[flash]} SCORED!`;
-        g.fillText(goalCaption, W / 2, H - 55);
+        if (replay?.goalReplay !== false) g.fillText(goalAnnouncement(), W / 2, H - 55);
     }
     else {
         const bw = 340;
@@ -1408,7 +1420,10 @@ function drawJumbo() {
         g.fillText(scoreArr[0], 36 + bw / 2, 212);
         g.fillText(scoreArr[1], W - 36 - bw / 2, 212);
         g.font = 'italic 900 62px Segoe UI, Arial';
-        g.fillStyle = !attract && !overtime && timeLeft <= 60 ? '#ff4545' : '#fff';
+        // Match the player's gold-yellow (#ffd54a) during overtime.
+        // Once ended, 0:00 is white; the final score itself never resets.
+        g.fillStyle = !attract && state !== 'ended' && overtime ? '#ffd54a'
+            : !attract && state !== 'ended' && !overtime && timeLeft <= 60 ? '#ff4545' : '#fff';
         g.fillText(attract ? 'LIVE' : clock, W / 2, 185);
         drawTurboClash(g, W / 2 - 150, H - 52, 40);
         drawPlayvora(g, W / 2 + 160, H - 52, 40);
@@ -2345,6 +2360,14 @@ function goalBound(pos, vel) {
     }
     return 0;
 }
+function isOwnGoalRedirect(team, beforeVel, afterVel, impactSpeed, beforeGoal, afterGoal) {
+    const ownEnd = team === 0 ? -1 : 1;
+    const towardOwnAfter = afterVel.z * ownEnd;
+    const impulseIntoOwnEnd = (afterVel.z - beforeVel.z) * ownEnd;
+    return impactSpeed >= 2 && towardOwnAfter >= 3 &&
+        impulseIntoOwnEnd >= Math.max(2.5, Math.abs(beforeVel.z) * .2) &&
+        beforeGoal !== ownEnd && afterGoal === ownEnd;
+}
 const _bvPrev = new V3();
 function carBall(c) {
     _qi.copy(c.q).invert();
@@ -2385,16 +2408,24 @@ function carBall(c) {
         ball.spin.copy(_d).cross(_c).multiplyScalar(.06);
     }
     if (state !== 'play' || netGuest()) return;
-    if (newTouch) {
-        c.stats.touches++;
-        lastTouch[c.team] = c;
-        lastToucher = c;
-        touchInfo = { name: c.name, team: c.team, t: +simTime.toFixed(2) };
-    }
     if (newTouch || poweredHit) {
         const ad = c.team === 0 ? 1 : -1;
         const before = goalBound(ball.pos, _bvPrev);
         const after = goalBound(ball.pos, ball.vel);
+        if (newTouch) {
+            const previousToucher = lastToucher;
+            c.stats.touches++;
+            lastTouch[c.team] = c;
+            lastToucher = c;
+            touchInfo = { name: c.name, team: c.team, t: +simTime.toFixed(2) };
+            if (isOwnGoalRedirect(c.team, _bvPrev, ball.vel, impactSpeed, before, after)) {
+                lastOwnGoalToucher = c;
+            } else if (previousToucher !== c || impactSpeed > 3.5) {
+                // Another car touched it, or this car made another meaningful
+                // hit that no longer qualifies as an own-goal redirect.
+                lastOwnGoalToucher = null;
+            }
+        }
         if (before === -ad && after !== -ad && simTime - c.lastSave > .6) {
             c.lastSave = simTime;
             c.stats.saves++;
@@ -2505,6 +2536,7 @@ function bump(v, dir, impact, at, attacker) {
 }
 const PRED_N = 90, PRED_DT = 1 / 30;
 const pred = Array.from({ length: PRED_N + 1 }, () => new V3());
+let botPredictionAt = -Infinity;
 const _pp = new V3(), _pv = new V3();
 function predictBall() {
     _pp.copy(ball.pos);
@@ -2793,7 +2825,8 @@ const sfx = {
 };
 let state = 'menu', attract = true, paused = false;
 let player = null, scoreArr = [0, 0], timeLeft = 300, overtime = false, otTime = 0;
-let matchRewardsClaimed = false;
+let matchRewardsClaimed = false, goalCoinsCredited = 0;
+let disconnectFinishOptions = null;
 let countT = 0, goalT = 0, kickoffT = 0, lastCount = 0, matchOverAfterGoal = false;
 let netGoalId = 0, netSeenGoalId = 0, netGoalPos = [0, BR, 0], netReplaySentAt = 0;
 const netReplaySources = new Map(), netReplayAcks = new Set();
@@ -2801,11 +2834,13 @@ function netAllReplayReady() {
     return !online.active || !online.isHost || !lastGoalReplay ||
         [...online.peers.keys()].every(seat => netReplayAcks.has(seat));
 }
-let lastTouch = [null, null], lastToucher = null, shake = 0, touchInfo = null, exciteB = 0, exciteR = 0, tension = 0;
+let lastTouch = [null, null], lastToucher = null, lastOwnGoalToucher = null, shake = 0, touchInfo = null, exciteB = 0, exciteR = 0, tension = 0;
 const goalLog = [];
 function setupMatch(isAttract) {
     attract = isAttract;
     matchRewardsClaimed = false;
+    goalCoinsCredited = 0;
+    disconnectFinishOptions = null;
     applyBallSkin();
     clearCars();
     const n = isAttract ? 2 : settings.mode;
@@ -2817,6 +2852,10 @@ function setupMatch(isAttract) {
             cars.push(createCar(team, human ? playerName : names[ni++], human));
         }
     player = cars.find(c => c.human) || null;
+    lastGoalTeam = -1;
+    lastOwnGoalBy = null;
+    lastOwnGoalToucher = null;
+    replayScorer = -1;
     recInit();
     lastGoalReplay = null;
     scoreArr = [0, 0];
@@ -2830,6 +2869,8 @@ function setupMatch(isAttract) {
 function setupOnlineMatch() {
     attract = false;
     matchRewardsClaimed = false;
+    goalCoinsCredited = 0;
+    disconnectFinishOptions = null;
     applyBallSkin();
     clearCars();
     remoteInputs.clear();
@@ -2846,6 +2887,10 @@ function setupOnlineMatch() {
         }
     }
     player = cars.find(c => c.human) || null;
+    lastGoalTeam = -1;
+    lastOwnGoalBy = null;
+    lastOwnGoalToucher = null;
+    replayScorer = -1;
     recInit(); lastGoalReplay = null;
     scoreArr = [0, 0]; timeLeft = settings.len;
     overtime = false; otTime = 0;
@@ -2868,6 +2913,7 @@ function netReset() {
     netLastInput = '';
     netInputT = 0;
     netGoalId = netSeenGoalId = 0;
+    netMetaSendAt = -Infinity;
     netGoalPos = [0, BR, 0];
     netReplaySentAt = 0;
     netReplaySources.clear();
@@ -2977,13 +3023,17 @@ function netSampleWorld(dt) {
     ball.vel.copy(_nbv);
     if (hasRotation) ball.q.copy(_netQ);
 }
+let netMetaSendAt = -Infinity;
 function onlineSnapshot() {
+    const now = performance.now() / 1000;
+    const includeNames = state === 'ended' || now - netMetaSendAt >= 2;
+    if (includeNames) netMetaSendAt = now;
     return {
         ht: performance.now() / 1000, replayFinal: !!(replay && replay.final),
         goalId: netGoalId, goalPos: netGoalPos, replayT: replay ? replay.t : null,
         replaySpeed: replay ? (replay.t >= replay.tEnd - 3 ? .35 : 1) : 1,
         state, timeLeft, overtime, otTime, scores: [...scoreArr], countT, goalT,
-        playerNames: cars.map(c=>({seat:c.netSeat,name:c.name,skin:c.skinId})),
+        ...(includeNames ? { playerNames: cars.map(c=>({seat:c.netSeat,name:c.name,skin:c.skinId})) } : {}),
         scorerSeat: replayScorer >= 0 ? cars[replayScorer]?.netSeat ?? null : null,
         goalTeam: lastGoalTeam, ownGoalBy: lastOwnGoalBy,
         ball: { pos: ball.pos.toArray(), vel: ball.vel.toArray(), spin: ball.spin.toArray(), q: ball.q.toArray(), active: ball.active },
@@ -3019,6 +3069,11 @@ function onlineApplySnapshot(snap) {
     }
     timeLeft = snap.timeLeft; overtime = !!snap.overtime; otTime = snap.otTime;
     scoreArr = snap.scores;
+    for (const data of snap.cars) {
+        const c = cars.find(c => c.netSeat === data.seat);
+        if (c) c.stats = data.stats;
+    }
+    creditEarnedGoals();
     updateScoreHud();
     $('clock').classList.toggle('ot', overtime);
     const scorerIdx = cars.findIndex(c => c.netSeat === snap.scorerSeat);
@@ -3030,10 +3085,8 @@ function onlineApplySnapshot(snap) {
         if (Array.isArray(snap.goalPos) && snap.goalPos.length === 3)
             showGoalBurst(snap.goalTeam, _nt.fromArray(snap.goalPos));
         if (snap.state === 'goal' || snap.state === 'replay') {
-            showCenter('GOAL!', 2.4, TEAM_CSS[snap.goalTeam]);
-            const sc = cars.find(c => c.netSeat === snap.scorerSeat);
-            showSub(lastOwnGoalBy ? `OWN GOAL BY ${lastOwnGoalBy}` :
-                `${sc ? sc.name : TEAM_NAME[snap.goalTeam]} SCORED!`, 2.4);
+            showCenter('GOAL!', Infinity, TEAM_CSS[snap.goalTeam]);
+            showSub(goalAnnouncement(), Infinity);
         }
     }
     if (snap.state === 'replay') {
@@ -3174,7 +3227,7 @@ function resetKickoff() {
     }
     lastTouch = [null, null];
     lastToucher = null;
-    lastOwnGoalBy = null;
+    lastOwnGoalToucher = null;
     if (rec) {
         rec.head = 0;
         rec.count = 0;
@@ -3236,22 +3289,23 @@ function onGoal(team) {
     scoreArr[team]++;
     updateScoreHud();
     lastGoalTeam = team;
-    const ownGoalBy = lastToucher && lastToucher.team !== team ? lastToucher : null;
+    const ownGoalBy = lastToucher && lastToucher.team !== team &&
+        lastOwnGoalToucher === lastToucher ? lastToucher : null;
     lastOwnGoalBy = ownGoalBy ? ownGoalBy.name : null;
     const attackers = cars.filter(c => c.team === team);
     const scorer = lastTouch[team] || (ownGoalBy && attackers.length === 1 ? attackers[0] : null);
-    replayScorer = scorer ? cars.indexOf(scorer) : -1;
+    const replayActor = ownGoalBy || scorer;
+    replayScorer = replayActor ? cars.indexOf(replayActor) : -1;
     saveLastGoalReplay();
     if (online.active && online.isHost) {
         netGoalId++;
         netGoalPos = ball.pos.toArray();
         netReplayAcks.clear();
         netReplaySentAt = performance.now();
-        if (lastGoalReplay) online.sendReplay(netGoalId, lastGoalReplay, team,
-            scorer ? scorer.netSeat : null);
     }
     if (scorer)
         scorer.stats.goals++;
+    creditEarnedGoals();
     showGoalBurst(team, ball.pos);
     ball.active = false;
     ball.mesh.visible = false;
@@ -3269,18 +3323,41 @@ function onGoal(team) {
     matchOverAfterGoal = overtime || timeLeft <= 0;
     if (!attract) {
         sfx.goal(!player || team === player.team);
-        showCenter('GOAL!', 2.4, TEAM_CSS[team]);
-        showSub(lastOwnGoalBy ? `OWN GOAL BY ${lastOwnGoalBy}` :
-            scorer ? `${scorer.name} SCORED${scorer.human ? '!' : ''}` : `${TEAM_NAME[team]} SCORED!`, 2.4);
+        showCenter('GOAL!', Infinity, TEAM_CSS[team]);
+        showSub(goalAnnouncement(), Infinity);
         feed(lastOwnGoalBy
             ? `<span style="color:${TEAM_CSS[team]}">${TEAM_NAME[team]}</span> goal (own goal by ${lastOwnGoalBy})`
             : `<span style="color:${TEAM_CSS[team]}">${scorer ? scorer.name : TEAM_NAME[team]}</span> scored`);
     }
+    // Deliver the goal state immediately on the reliable control channel as
+    // well as the live channel, before a subsequent disconnect can end play.
+    if (online.active && online.isHost) {
+        online.sendSnapshot(onlineSnapshot());
+        if (lastGoalReplay) online.sendReplay(netGoalId, lastGoalReplay, team,
+            replayActor ? replayActor.netSeat : null);
+    }
 }
-function endMatch() {
+function creditEarnedGoals() {
+    if (!player || attract) return;
+    const goals = Math.max(0, Math.floor(player.stats.goals));
+    if (goals <= goalCoinsCredited) return;
+    STORE.coins += (goals - goalCoinsCredited) * 100;
+    goalCoinsCredited = goals;
+    saveStore();
+    updateCoinUI();
+}
+function endMatch(options = disconnectFinishOptions || {}) {
+    if (state === 'ended' && matchRewardsClaimed) return;
+    disconnectFinishOptions = null;
     state = 'ended';
-    if (online.active && !online.finished) online.finishMatch(online.isHost ? onlineSnapshot() : null);
-    const win = scoreArr[0] > scoreArr[1] ? 0 : 1, r = $('result');
+    if (!options.disconnect && online.active && !online.finished)
+        online.finishMatch(online.isHost ? onlineSnapshot() : null);
+    const departingSeat = options.disconnectedSeat;
+    const win = options.disconnect
+        ? (Number.isInteger(departingSeat) && departingSeat >= 0 && departingSeat < settings.mode * 2
+            ? 1 - departingSeat % 2 : (player ? player.team : 0))
+        : scoreArr[0] > scoreArr[1] ? 0 : scoreArr[1] > scoreArr[0] ? 1 : (player ? 1 - player.team : 1);
+    const r = $('result');
     r.textContent = win === (player ? player.team : 0) ? 'VICTORY' : 'DEFEAT';
     r.style.color = win === 0 ? TEAM_CSS[0] : TEAM_CSS[1];
     $('finalScore').innerHTML = `<span style="color:${TEAM_CSS[0]}">${scoreArr[0]}</span> &nbsp;&mdash;&nbsp; <span style="color:${TEAM_CSS[1]}">${scoreArr[1]}</span>`;
@@ -3292,12 +3369,13 @@ function endMatch() {
         matchRewardsClaimed = true;
         $('coinGain').innerHTML = '';
         if (player && !attract) {
+            creditEarnedGoals();
             const won = win === player.team;
-            const matchReward = won ? (online.active ? 200 : [100, 200, 300][settings.diff] || 100) : 0;
+            const matchReward = won && !options.disconnect ? (online.active ? 200 : [100, 200, 300][settings.diff] || 100) : 0;
             const goals = player.stats.goals;
             const goalBonus = goals * 100;
             const earn = matchReward + goalBonus;
-            STORE.coins += earn;
+            STORE.coins += matchReward;
             saveStore();
             updateCoinUI();
             $('coinGain').innerHTML = `<span class="coinIco"></span>+${earn} COINS<small>${goals} GOAL${goals === 1 ? '' : 'S'} = ${goalBonus} BONUS</small>`;
@@ -3305,6 +3383,7 @@ function endMatch() {
     }
     $('end').classList.remove('hidden');
     $('hud').classList.add('hidden');
+    $('pause').classList.add('hidden');
     sfx.engine(0, false, false);
     sfx.playResult(win === (player ? player.team : 0));
 }
@@ -3378,6 +3457,7 @@ function setSearch(heading, detail, showSpinner = true) {
 }
 async function searchRealPlayer(checkFirst = false) {
     if (checkFirst && $('retrySearch').disabled) return;
+    disconnectFinishOptions = null;
     const attempt = ++onlineSearchAttempt, current = () => attempt === onlineSearchAttempt;
     let checking = checkFirst;
     if (checkFirst) $('retrySearch').disabled = true;
@@ -3392,7 +3472,7 @@ async function searchRealPlayer(checkFirst = false) {
         if (!current()) return;
         if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
         sfx.init(); sfx.stopGoal(); sfx.stopResult();
-        perfHold(3000);
+        perfHold(900);
         $('matchSearch').classList.add('hidden');
         $('end').classList.add('hidden');
         $('pause').classList.add('hidden');
@@ -3422,13 +3502,17 @@ async function searchRealPlayer(checkFirst = false) {
         if (online.isHost && id === netGoalId) netReplayAcks.add(seat);
     };
     online.onSkin = (seat, id) => { const c = cars.find(c => c.netSeat === seat); if (c) repaintCar(c, id); };
-    online.onLost = (message, reason) => {
-        if (!current() || state === 'ended' || online.finished) return;
+    online.onLost = (message, reason, disconnectedSeat) => {
+        if (!current() || state === 'ended') return;
+        if (reason === 'disconnect' && online.active && !attract && player) {
+            finishDisconnectedMatch(disconnectedSeat);
+            return;
+        }
         const checkFailed = checking;
         toMenu(true);
         $('choosePlay').classList.add('hidden');
         if (checkFailed) setSearchError('ONLINE UNAVAILABLE');
-        else if (reason === 'disconnect') setSearch('PLAYER DISCONNECTED', 'MATCH ENDED', false);
+        else if (reason === 'disconnect') setSearch('MATCH ENDED', '', false);
         else if (message === ONLINE_NO_PLAYERS) setSearch('ONLINE MATCH SEARCH ENDED', message, false);
         else setSearchError('ONLINE MATCH SEARCH ENDED');
     };
@@ -3440,6 +3524,7 @@ async function searchRealPlayer(checkFirst = false) {
     }
 }
 function toMenu(backToChoice = true) {
+    disconnectFinishOptions = null;
     onlineSearchAttempt++;
     if (online.active || online.finding || online.room) online.cancel();
     $('matchSearch').classList.add('hidden');
@@ -3519,7 +3604,22 @@ function finishMatch() {
         return;
     endMatch();
 }
-function startReplay(final = false, sharedSource = null, replayId = netGoalId) {
+function finishDisconnectedMatch(disconnectedSeat) {
+    if (state === 'ended' || disconnectFinishOptions) return;
+    disconnectFinishOptions = {disconnect:true, disconnectedSeat};
+    $('matchSearch').classList.add('hidden');
+    $('end').classList.add('hidden');
+    $('hud').classList.remove('hidden');
+    $('pause').classList.add('hidden');
+    paused = false;
+    const recentGoal = (state === 'goal' || state === 'replay') && lastGoalTeam >= 0 &&
+        rec && rec.count >= 20 ? rec : null;
+    const goalSource = lastGoalReplay && lastGoalReplay.count >= 20 ? lastGoalReplay : recentGoal;
+    const source = goalSource || (rec && rec.count >= 20 ? rec : null);
+    if (!source || !startReplay(true, source, netGoalId, !!goalSource))
+        endMatch(disconnectFinishOptions);
+}
+function startReplay(final = false, sharedSource = null, replayId = netGoalId, goalReplay = true) {
     const source = sharedSource || (online.active ? lastGoalReplay : (final ? lastGoalReplay : rec));
     if (online.active && !online.isHost && !sharedSource) return false;
     if (!source || source.count < 20)
@@ -3531,20 +3631,18 @@ function startReplay(final = false, sharedSource = null, replayId = netGoalId) {
     let k = 0;
     while (k < n - 2 && source.buf[idx[k + 1] * S] <= tStart)
         k++;
-    replay = { source, id: replayId, final, idx, tStart, tEnd, t: tStart, k,
-        team: lastGoalTeam, scorer: replayScorer, cut: false, snapped: false,
-        hold: 0, boomed: false };
+    replay = { source, id: replayId, final, goalReplay, idx, tStart, tEnd, t: tStart, k,
+        team: goalReplay ? lastGoalTeam : -1, scorer: goalReplay ? replayScorer : -1,
+        cut: false, snapped: false, hold: 0, boomed: false };
     state = 'replay';
     ball.active = true;
     ball.mesh.visible = true;
     shock.visible = false;
     shockT = 0;
     shake = 0;
-    const sc = replayScorer >= 0 ? cars[replayScorer] : null;
-    $('replayBadge').style.background = lastGoalTeam ? 'linear-gradient(180deg,#ff5050,#c4161c)' : 'linear-gradient(180deg,#4b97ff,#1c5fd6)';
+    $('replayBadge').style.background = !goalReplay ? '#273654' : lastGoalTeam === 1 ? 'linear-gradient(180deg,#ff5050,#c4161c)' : 'linear-gradient(180deg,#4b97ff,#1c5fd6)';
     $('replayBadge').innerHTML = '<i></i>' + (final ? 'FINAL REPLAY' : 'REPLAY');
-    $('replayWho').textContent = lastOwnGoalBy ? `OWN GOAL BY ${lastOwnGoalBy}` :
-        `${sc ? sc.name : TEAM_NAME[lastGoalTeam]} SCORED!`;
+    $('replayWho').textContent = goalReplay ? goalAnnouncement() : '';
     $('hud').classList.add('replaying');
     $('center').classList.remove('show');
     $('sub').classList.remove('show');
@@ -3596,7 +3694,7 @@ function stepReplay(dt) {
     if (r.t >= r.tEnd) {
         r.t = r.tEnd;
         replayApply();
-        if (!r.boomed) showGoalBurst(r.team, ball.pos);
+        if (!r.boomed && r.goalReplay) showGoalBurst(r.team, ball.pos);
         r.boomed = true;
         ball.active = false;
         ball.mesh.visible = false;
@@ -4083,14 +4181,17 @@ $('storeClose').onclick = () => storeUI.hide();
 online.setSkin && online.setSkin(STORE.equipped);
 updateCoinUI();
 $('retrySearch').onclick = () => searchRealPlayer(true);
-$('cancelSearch').onclick = () => { online.cancel(); toMenu(true); };
+$('cancelSearch').onclick = () => {
+    online.cancel();
+    toMenu(true);
+};
 let acc = 0, last = performance.now(), clockTime = 0;
 const camPos = new V3(0, 50, -150), camLook = new V3(), camLookT = new V3(), camPosT = new V3();
 let orbitA = 0, debugCam = null, camDirX = 0, camDirZ = 1, camSnap = true, camFlipBlend = 0;
 const _cn = new V3();
 function update(dt) {
     clockTime += dt;
-    if (state === 'ended') return;
+    if (state === 'ended' || (attract && (online.finding || online.starting))) return;
     if (online.active && !online.isHost) {
         if (player) {
             readPlayer(player);
@@ -4145,7 +4246,7 @@ function update(dt) {
                 }
                 lastCount = n;
             }
-            if (state === 'play' && simTime - lastRecT >= 1 / 60 - 1e-6) {
+            if (state === 'play' && simTime - lastRecT >= 1 / 30 - 1e-6) {
                 recFrame();
                 lastRecT = simTime;
             }
@@ -4211,8 +4312,11 @@ function update(dt) {
     if (state === 'ended')
         return;
     if (state === 'play' || state === 'goal') {
-        predictBall();
-        assignRoles();
+        if (!online.active && simTime - botPredictionAt >= .083) {
+            predictBall();
+            assignRoles();
+            botPredictionAt = simTime;
+        }
         for (const c of cars) {
             if (online.active) {
                 if (c.netSeat === online.seat) {
@@ -4229,7 +4333,7 @@ function update(dt) {
             else botThink(c, dt);
         }
         const scale = state === 'goal' && goalT > (attract ? 1.5 : 2.0) ? .35 : 1;
-        acc += dt * scale;
+        acc = Math.min(acc + dt * scale, STEP * 8);
         while (acc >= STEP) {
             acc -= STEP;
             simTime += STEP;
@@ -4250,7 +4354,7 @@ function update(dt) {
                         carBall(c);
             }
         }
-        if (state === 'play' && simTime - lastRecT >= 1 / 60 - 1e-6) {
+        if (state === 'play' && simTime - lastRecT >= 1 / 30 - 1e-6) {
             recFrame();
             lastRecT = simTime;
         }
@@ -4613,7 +4717,7 @@ function render(dt) {
     for (const t of ledTexes)
         t.offset.x = (t.offset.x + dt * .02) % 1;
     crowdU.uTime.value = clockTime;
-    sky.material.uniforms.uTime.value = clockTime;
+    if (sky.material.uniforms?.uTime) sky.material.uniforms.uTime.value = clockTime;
     glassBall.value.copy(ball.mesh.position).setY(ball.active && ball.mesh.visible ? ball.mesh.position.y : -999);
     crowdU.uExciteB.value = exciteB;
     crowdU.uExciteR.value = exciteR;
@@ -4727,7 +4831,7 @@ function render(dt) {
     camera.lookAt(camLook);
     updateNameTags();
     if (!attract && player) {
-        $('clock').textContent = overtime ? '+' + fmt(otTime) : fmt(timeLeft);
+        $('clock').textContent = scoreboardClockText();
         $('clock').classList.toggle('last-minute', !overtime && timeLeft <= 60);
         drawBoost(player.boost, player.boostIdle, player.boosting);
         const on = state !== 'ended' && !paused;
@@ -4784,6 +4888,7 @@ function drawBoost(b, idle, boosting) {
     g.fillText(label, cx, cx + 66);
 }
 let perfT = 0, perfN = 0, perfSum = 0, prChangedAt = 0, prNext = 0, perfHoldUntil = 0, prChanges = 0, gfxChangedAt = 0, gfxRaisedAt = -1e9, perfLock = false;
+let liveFps = 0, fpsFrames = 0, fpsStarted = 0;
 function perfHold(ms) { perfT = perfN = perfSum = 0; perfHoldUntil = performance.now() + ms; }
 function governor(rawDt, now) {
     if (now < perfHoldUntil || perfLock)
@@ -4805,8 +4910,8 @@ function governor(rawDt, now) {
                 const pr = prNext || prCur;
                 if (g.on && g.tier > 2)
                     g.tier = 2;
-                else if (pr > 1) {
-                    prNext = Math.max(1, +(pr - .15).toFixed(2));
+                else if (pr > .9) {
+                    prNext = Math.max(.9, +(pr - .12).toFixed(2));
                     prChangedAt = now;
                 }
                 else if (g.on && g.tier > 0)
@@ -4828,14 +4933,20 @@ function governor(rawDt, now) {
 document.addEventListener('visibilitychange', () => { perfHold(1500); last = performance.now(); sfx.pause(document.hidden || paused); });
 function frame(now) {
     requestAnimationFrame(frame);
-    if (online.active && !online.finished && state !== 'ended' && !online.isHost && online.lastPacket && Date.now() - online.lastPacket > 20000) {
-        online.lost('Player disconnected. Match ended.', 'disconnect');
+    if (online.active && !online.finished && state !== 'ended' && !online.isHost && online.lastPacket && Date.now() - online.lastPacket > 14000) {
+        online.lost('Match ended.', 'disconnect', 0);
     }
     const raw = (now - last) / 1000, dt = Math.min(.1, raw);
     last = now;
+    if (!fpsStarted) fpsStarted = now;
+    if (++fpsFrames && now - fpsStarted >= 1000) {
+        liveFps = Math.round(fpsFrames * 1000 / (now - fpsStarted));
+        fpsFrames = 0; fpsStarted = now;
+    }
     SKIN_TIME.value = now / 1000;
     if (storeUI.open && !online.active)
         return;
+    if (document.hidden && !online.active) return;
     if (!paused || online.active)
         update(dt);
     if (prNext) {
@@ -4846,9 +4957,9 @@ function frame(now) {
     }
     if (online.active && !online.finished && online.isHost) {
         onlineSnapshotTimer += dt;
-        if (onlineSnapshotTimer >= 1 / 30) {
+        if (onlineSnapshotTimer >= 1 / 20) {
             online.sendSnapshot(onlineSnapshot());
-            onlineSnapshotTimer %= 1 / 30;
+            onlineSnapshotTimer %= 1 / 20;
         }
     }
     if (splashUp()) {
@@ -4863,6 +4974,7 @@ function frame(now) {
     }
     if (!gameWarm)
         warmGame();
+    if (attract && (online.finding || online.starting)) return;
     render(paused && !online.active ? 0 : dt);
     probeEnv();
     governor(Math.min(raw, .25), now);
@@ -4889,7 +5001,11 @@ window.NITRO = {
     get state() { return state; }, get cars() { return cars; }, get score() { return scoreArr; },
     set freezeBots(v) { freezeBots = v; },
     set debugCam(v) { debugCam = v ? { pos: new V3(...v.pos), look: new V3(...v.look), fov: v.fov } : null; },
-    get sfx() { return sfx; }, get camSnap() { return camSnap; }, get perf() { return { prCur, prNext, prChanges, holdLeft: Math.max(0, perfHoldUntil - performance.now()) }; },
+    get sfx() { return sfx; }, get camSnap() { return camSnap; },
+    get perf() { return { fps: liveFps, pingMs: Math.round(netRtt * 1000),
+        queuedBytes: [...online.peers.values()].reduce((n,p) => n + (p.state?.bufferedAmount || 0),0),
+        lowLagMode: LOW_LAG_MODE, prCur, prNext, prChanges,
+        holdLeft: Math.max(0, perfHoldUntil - performance.now()) }; },
     forcePR(v) { prNext = v; },
     get gfx() { return { on: POST.st.on, tier: POST.st.tier, max: POST.st.max, hdr: HDR_OK }; },
     set gfxTier(v) { POST.st.tier = clamp(v | 0, 0, POST.st.max); },
